@@ -18,19 +18,8 @@ CORS(app)
 
 print("正在加载YOLO模型...")
 try:
-    # 修复：添加 providers 参数
     session = ort.InferenceSession("best.onnx", providers=['CPUExecutionProvider'])
     print("YOLO模型加载成功!")
-
-    # 打印模型输入输出信息
-    print("模型输入信息:")
-    for input_info in session.get_inputs():
-        print(f"  名称: {input_info.name}, 形状: {input_info.shape}, 类型: {input_info.type}")
-
-    print("模型输出信息:")
-    for output_info in session.get_outputs():
-        print(f"  名称: {output_info.name}, 形状: {output_info.shape}, 类型: {output_info.type}")
-
 except Exception as e:
     print(f"模型加载失败: {e}")
     session = None
@@ -92,7 +81,7 @@ def detect():
 
         # 后处理
         print("开始后处理...")
-        detections = postprocess(outputs)
+        detections = postprocess(outputs[0])
         print(f"检测到 {len(detections)} 个对象")
 
         return jsonify({
@@ -121,7 +110,6 @@ def preprocess(image):
         # 调整大小到640x640
         image = cv2.resize(image, (640, 640))
         print(f"调整大小后形状: {image.shape}")
-        # 已经是RGB，不需要转换
         # 归一化
         image = image.astype(np.float32) / 255.0
         print(f"归一化后数据类型: {image.dtype}")
@@ -138,41 +126,53 @@ def preprocess(image):
 
 
 def postprocess(outputs, conf_threshold=0.25):
-    """通用YOLO后处理 - 尝试多种输出格式"""
+    """YOLOv8后处理 - 最终正确版本"""
     try:
-        print("=== 开始后处理 ===")
+        print(f"后处理输入形状: {outputs.shape}")
 
-        # 检查所有输出
-        for i, output in enumerate(outputs):
-            print(f"输出[{i}] 形状: {output.shape}, 数据类型: {output.dtype}")
-            print(f"输出[{i}] 数值范围: {output.min():.6f} ~ {output.max():.6f}")
+        # YOLOv8输出格式: [1, 9, 8400]
+        # 实际格式是: [x, y, w, h, class0, class1, class2, class3, class4]
+        # 注意：输出是原始logits，需要sigmoid激活
 
-            # 检查前几个值的样本
-            if len(output.shape) == 3:
-                sample = output[0, :, :5]  # 取前5个检测点的前5个值
-                print(f"输出[{i}] 样本数据 (前5个检测点):")
-                for j in range(min(5, sample.shape[0])):
-                    print(f"  检测点 {j}: {sample[j]}")
+        outputs = outputs[0]  # [9, 8400]
+        outputs = outputs.transpose(1, 0)  # [8400, 9]
 
-        # 尝试不同的输出格式解析
+        print(f"转换后形状: {outputs.shape}")
+
+        # 应用sigmoid激活函数到类别分数部分
+        outputs[:, 4:] = 1.0 / (1.0 + np.exp(-outputs[:, 4:]))
+
         detections = []
 
-        # 方法1: 尝试YOLOv8格式 [1, 9, 8400]
-        if len(outputs) == 1 and outputs[0].shape == (1, 9, 8400):
-            print("尝试YOLOv8格式解析...")
-            detections = parse_yolov8_output(outputs[0], conf_threshold)
+        for i in range(outputs.shape[0]):
+            detection = outputs[i]
 
-        # 方法2: 尝试YOLOv5格式 [1, 25200, 85]
-        elif len(outputs) == 1 and outputs[0].shape == (1, 25200, 85):
-            print("尝试YOLOv5格式解析...")
-            detections = parse_yolov5_output(outputs[0], conf_threshold)
+            # 前4个是边界框 [x, y, w, h] - 这些不需要sigmoid
+            bbox = detection[:4]
 
-        # 方法3: 尝试其他可能的格式
-        else:
-            print("尝试通用格式解析...")
-            for i, output in enumerate(outputs):
-                if len(output.shape) == 3:
-                    detections.extend(parse_generic_output(output, conf_threshold, f"output_{i}"))
+            # 后5个是类别置信度（已经过sigmoid）
+            class_scores = detection[4:]
+
+            # 找到最高置信度的类别
+            class_id = np.argmax(class_scores)
+            confidence = class_scores[class_id]
+
+            if confidence > conf_threshold:
+                x, y, w, h = bbox
+
+                if class_id < len(class_names):
+                    detections.append({
+                        'class': int(class_id),
+                        'name': class_names[class_id],
+                        'chineseName': class_names_chinese[class_id],
+                        'confidence': float(confidence),
+                        'bbox': {
+                            'x': float(x),
+                            'y': float(y),
+                            'width': float(w),
+                            'height': float(h)
+                        }
+                    })
 
         print(f"初步检测到 {len(detections)} 个对象")
 
@@ -182,8 +182,9 @@ def postprocess(outputs, conf_threshold=0.25):
             print(f"NMS后剩余 {len(result)} 个对象")
             return result
         else:
-            print("未检测到任何对象")
-            return []
+            # 如果没检测到，尝试降低阈值
+            print("未检测到对象，尝试降低阈值...")
+            return postprocess_low_confidence(outputs)
 
     except Exception as e:
         print(f"后处理错误: {str(e)}")
@@ -191,32 +192,25 @@ def postprocess(outputs, conf_threshold=0.25):
         return []
 
 
-def parse_yolov8_output(output, conf_threshold):
-    """解析YOLOv8输出格式 [1, 9, 8400]"""
+def postprocess_low_confidence(outputs, conf_threshold=0.1):
+    """低置信度后处理"""
     detections = []
-    output_data = output[0]  # [9, 8400]
-    output_data = output_data.transpose(1, 0)  # [8400, 9]
 
-    print(f"YOLOv8解析: 转换后形状 {output_data.shape}")
-
-    for i in range(output_data.shape[0]):
-        detection = output_data[i]
-        confidence = detection[4]
+    for i in range(outputs.shape[0]):
+        detection = outputs[i]
+        class_scores = detection[4:]
+        class_id = np.argmax(class_scores)
+        confidence = class_scores[class_id]
 
         if confidence > conf_threshold:
-            class_scores = detection[5:]
-            class_id = np.argmax(class_scores)
-            class_confidence = class_scores[class_id]
-            final_confidence = confidence * class_confidence
+            x, y, w, h = detection[:4]
 
-            if final_confidence > conf_threshold and class_id < len(class_names):
-                x, y, w, h = detection[0], detection[1], detection[2], detection[3]
-
+            if class_id < len(class_names):
                 detections.append({
                     'class': int(class_id),
                     'name': class_names[class_id],
                     'chineseName': class_names_chinese[class_id],
-                    'confidence': float(final_confidence),
+                    'confidence': float(confidence),
                     'bbox': {
                         'x': float(x),
                         'y': float(y),
@@ -225,87 +219,14 @@ def parse_yolov8_output(output, conf_threshold):
                     }
                 })
 
-    return detections
+    print(f"低阈值检测到 {len(detections)} 个对象")
 
+    if detections:
+        result = non_max_suppression(detections)
+        print(f"低阈值NMS后剩余 {len(result)} 个对象")
+        return result
 
-def parse_yolov5_output(output, conf_threshold):
-    """解析YOLOv5输出格式 [1, 25200, 85]"""
-    detections = []
-    output_data = output[0]  # [25200, 85]
-
-    print(f"YOLOv5解析: 输出形状 {output_data.shape}")
-
-    for i in range(output_data.shape[0]):
-        detection = output_data[i]
-        confidence = detection[4]
-
-        if confidence > conf_threshold:
-            class_scores = detection[5:5 + len(class_names)]
-            class_id = np.argmax(class_scores)
-            class_confidence = class_scores[class_id]
-            final_confidence = confidence * class_confidence
-
-            if final_confidence > conf_threshold and class_id < len(class_names):
-                x, y, w, h = detection[0], detection[1], detection[2], detection[3]
-
-                detections.append({
-                    'class': int(class_id),
-                    'name': class_names[class_id],
-                    'chineseName': class_names_chinese[class_id],
-                    'confidence': float(final_confidence),
-                    'bbox': {
-                        'x': float(x),
-                        'y': float(y),
-                        'width': float(w),
-                        'height': float(h)
-                    }
-                })
-
-    return detections
-
-
-def parse_generic_output(output, conf_threshold, output_name):
-    """通用输出解析"""
-    detections = []
-
-    if len(output.shape) == 3:  # [batch, num_detections, features]
-        output_data = output[0]  # 去掉batch维度
-
-        print(f"通用解析 {output_name}: 形状 {output_data.shape}")
-
-        # 尝试推断特征维度
-        num_features = output_data.shape[1]
-        print(f"特征维度: {num_features}")
-
-        # 假设最后几个维度是类别分数
-        if num_features >= 5 + len(class_names):
-            for i in range(output_data.shape[0]):
-                detection = output_data[i]
-                confidence = detection[4]
-
-                if confidence > conf_threshold:
-                    class_scores = detection[5:5 + len(class_names)]
-                    class_id = np.argmax(class_scores)
-                    class_confidence = class_scores[class_id]
-                    final_confidence = confidence * class_confidence
-
-                    if final_confidence > conf_threshold and class_id < len(class_names):
-                        x, y, w, h = detection[0], detection[1], detection[2], detection[3]
-
-                        detections.append({
-                            'class': int(class_id),
-                            'name': class_names[class_id],
-                            'chineseName': class_names_chinese[class_id],
-                            'confidence': float(final_confidence),
-                            'bbox': {
-                                'x': float(x),
-                                'y': float(y),
-                                'width': float(w),
-                                'height': float(h)
-                            }
-                        })
-
-    return detections
+    return []
 
 
 def non_max_suppression(detections, iou_threshold=0.45):
