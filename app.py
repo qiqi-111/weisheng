@@ -7,6 +7,7 @@ from PIL import Image
 import io
 import json
 import os
+import traceback
 
 app = Flask(__name__)
 
@@ -46,6 +47,8 @@ def detect():
     try:
         # 接收JSON数据
         data = request.get_json()
+        print("收到请求数据")
+
         if not data or 'image' not in data:
             return jsonify({'success': False, 'error': '没有收到图片数据'})
 
@@ -53,23 +56,34 @@ def detect():
             return jsonify({'success': False, 'error': '模型未加载'})
 
         # 解码base64图片
+        print("开始解码图片...")
         image_data = base64.b64decode(data['image'])
         image = Image.open(io.BytesIO(image_data))
+        print(f"图片格式: {image.format}, 模式: {image.mode}, 大小: {image.size}")
 
         # 转换为RGB（处理PNG透明通道）
         if image.mode != 'RGB':
             image = image.convert('RGB')
 
-        image = np.array(image)
+        image_np = np.array(image)
+        print(f"图片numpy数组形状: {image_np.shape}")
 
         # 预处理
-        input_tensor = preprocess(image)
+        print("开始预处理...")
+        input_tensor = preprocess(image_np)
+        print(f"输入张量形状: {input_tensor.shape}")
 
         # 模型推理
+        print("开始模型推理...")
         outputs = session.run(None, {session.get_inputs()[0].name: input_tensor})
+        print(f"模型输出数量: {len(outputs)}")
+        for i, output in enumerate(outputs):
+            print(f"输出{i}形状: {output.shape}")
 
         # 后处理
+        print("开始后处理...")
         detections = postprocess(outputs[0])
+        print(f"检测到 {len(detections)} 个对象")
 
         return jsonify({
             'success': True,
@@ -80,65 +94,100 @@ def detect():
 
     except Exception as e:
         print(f"检测错误: {str(e)}")
+        error_traceback = traceback.format_exc()
+        print(f"错误堆栈: {error_traceback}")
+
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'traceback': error_traceback
         })
 
 
 def preprocess(image):
     """YOLO预处理"""
-    # 调整大小到640x640
-    image = cv2.resize(image, (640, 640))
-    # 已经是RGB，不需要转换
-    # 归一化
-    image = image.astype(np.float32) / 255.0
-    # HWC to CHW
-    image = image.transpose(2, 0, 1)
-    # 添加batch维度
-    image = np.expand_dims(image, 0)
-    return image
+    try:
+        print(f"预处理输入形状: {image.shape}")
+        # 调整大小到640x640
+        image = cv2.resize(image, (640, 640))
+        print(f"调整大小后形状: {image.shape}")
+        # 已经是RGB，不需要转换
+        # 归一化
+        image = image.astype(np.float32) / 255.0
+        print(f"归一化后数据类型: {image.dtype}")
+        # HWC to CHW
+        image = image.transpose(2, 0, 1)
+        print(f"转置后形状: {image.shape}")
+        # 添加batch维度
+        image = np.expand_dims(image, 0)
+        print(f"添加batch维度后形状: {image.shape}")
+        return image
+    except Exception as e:
+        print(f"预处理错误: {str(e)}")
+        raise e
 
 
 def postprocess(outputs, conf_threshold=0.25):
     """YOLO后处理 - 简化版本"""
-    detections = []
+    try:
+        print(f"后处理输入形状: {outputs.shape}")
+        print(f"后处理输入数据类型: {outputs.dtype}")
 
-    # outputs[0] 形状是 [1, 25200, 85]
-    # 85 = [x, y, w, h, conf, class0, class1, ... class4]
+        detections = []
 
-    for i in range(outputs[0].shape[1]):
-        detection = outputs[0][0][i]
-        confidence = detection[4]  # 物体置信度
+        # outputs[0] 形状是 [1, 25200, 85]
+        # 85 = [x, y, w, h, conf, class0, class1, ... class4]
 
-        if confidence > conf_threshold:
-            # 找到类别
-            class_scores = detection[5:]
-            class_id = np.argmax(class_scores)
-            class_confidence = class_scores[class_id]
+        print(f"输出数据形状: {outputs.shape}")
+        print(f"输出数据类型: {outputs.dtype}")
 
-            # 综合置信度
-            final_confidence = confidence * class_confidence
+        # 修复：正确的索引方式
+        for i in range(outputs.shape[1]):
+            if i % 5000 == 0:  # 每5000个检测打印一次
+                print(f"处理第 {i} 个检测...")
 
-            if final_confidence > conf_threshold:
-                # 提取边界框 [x, y, w, h] - 已经是中心坐标和宽高
-                x, y, w, h = detection[0], detection[1], detection[2], detection[3]
+            # 修复：正确的索引 - outputs[0, i, :] 而不是 outputs[0][0][i]
+            detection = outputs[0, i, :]
+            confidence = detection[4]  # 物体置信度
 
-                detections.append({
-                    'class': int(class_id),
-                    'name': class_names[class_id],
-                    'chineseName': class_names_chinese[class_id],
-                    'confidence': float(final_confidence),
-                    'bbox': {
-                        'x': float(x),
-                        'y': float(y),
-                        'width': float(w),
-                        'height': float(h)
-                    }
-                })
+            if confidence > conf_threshold:
+                # 找到类别
+                class_scores = detection[5:]
+                class_id = np.argmax(class_scores)
+                class_confidence = class_scores[class_id]
 
-    # 简单的NMS
-    return simple_nms(detections)
+                # 综合置信度
+                final_confidence = confidence * class_confidence
+
+                if final_confidence > conf_threshold:
+                    # 提取边界框 [x, y, w, h] - 已经是中心坐标和宽高
+                    x, y, w, h = detection[0], detection[1], detection[2], detection[3]
+
+                    detections.append({
+                        'class': int(class_id),
+                        'name': class_names[class_id],
+                        'chineseName': class_names_chinese[class_id],
+                        'confidence': float(final_confidence),
+                        'bbox': {
+                            'x': float(x),
+                            'y': float(y),
+                            'width': float(w),
+                            'height': float(h)
+                        }
+                    })
+
+        print(f"初步检测到 {len(detections)} 个对象")
+
+        # 简单的NMS
+        result = simple_nms(detections)
+        print(f"NMS后剩余 {len(result)} 个对象")
+
+        return result
+
+    except Exception as e:
+        print(f"后处理错误: {str(e)}")
+        print(f"错误堆栈: {traceback.format_exc()}")
+        raise e
 
 
 def simple_nms(detections, iou_threshold=0.5):
