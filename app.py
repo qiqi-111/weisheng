@@ -126,8 +126,8 @@ def preprocess(image):
         raise e
 
 
-def postprocess(outputs, original_size, conf_threshold=0.25):
-    """YOLOv8后处理 - 修正坐标转换"""
+def postprocess(outputs, original_size, conf_threshold=0.5):  # 提高置信度阈值
+    """YOLOv8后处理 - 提高检测质量"""
     try:
         print(f"后处理输入形状: {outputs.shape}")
         print(f"原始图片尺寸: {original_size}")
@@ -144,6 +144,9 @@ def postprocess(outputs, original_size, conf_threshold=0.25):
         detections = []
         original_width, original_height = original_size
 
+        # 统计每个类别的检测数量
+        class_counts = {class_id: 0 for class_id in range(len(class_names))}
+
         for i in range(outputs.shape[0]):
             detection = outputs[i]
 
@@ -157,6 +160,7 @@ def postprocess(outputs, original_size, conf_threshold=0.25):
             class_id = np.argmax(class_scores)
             confidence = class_scores[class_id]
 
+            # 使用更高的置信度阈值来减少误检
             if confidence > conf_threshold:
                 # YOLO输出的是归一化的中心坐标 [cx, cy, w, h]
                 cx, cy, w, h = bbox
@@ -171,34 +175,46 @@ def postprocess(outputs, original_size, conf_threshold=0.25):
                 x1 = x_center - bbox_width / 2
                 y1 = y_center - bbox_height / 2
 
-                if class_id < len(class_names):
-                    detections.append({
-                        'class': int(class_id),
-                        'name': class_names[class_id],
-                        'chineseName': class_names_chinese[class_id],
-                        'confidence': float(confidence),
-                        'bbox': {
-                            'x': float(x1),  # 左上角x
-                            'y': float(y1),  # 左上角y
-                            'width': float(bbox_width),
-                            'height': float(bbox_height)
-                        }
-                    })
+                # 检查边界框是否合理（不能太小）
+                if bbox_width > 10 and bbox_height > 10:  # 最小尺寸限制
+                    if class_id < len(class_names):
+                        class_counts[class_id] += 1
+                        detections.append({
+                            'class': int(class_id),
+                            'name': class_names[class_id],
+                            'chineseName': class_names_chinese[class_id],
+                            'confidence': float(confidence),
+                            'bbox': {
+                                'x': float(x1),  # 左上角x
+                                'y': float(y1),  # 左上角y
+                                'width': float(bbox_width),
+                                'height': float(bbox_height)
+                            }
+                        })
 
         print(f"初步检测到 {len(detections)} 个对象")
+        print(f"各类别检测数量: {class_counts}")
 
-        # 应用NMS
+        # 应用更严格的NMS
         if detections:
-            result = non_max_suppression(detections)
-            print(f"NMS后剩余 {len(result)} 个对象")
+            result = non_max_suppression(detections, iou_threshold=0.3)  # 更严格的IoU阈值
+            print(f"严格NMS后剩余 {len(result)} 个对象")
 
-            # 限制最大返回数量，避免过多检测框
-            if len(result) > 50:
-                result = result[:50]
-                print(f"限制返回数量为50个对象")
+            # 进一步过滤：只保留置信度最高的几个检测
+            if len(result) > 10:  # 如果还是太多，只保留置信度最高的10个
+                result = sorted(result, key=lambda x: x['confidence'], reverse=True)[:10]
+                print(f"限制返回数量为10个最高置信度对象")
+
+            # 打印最终检测结果
+            final_counts = {}
+            for det in result:
+                class_id = det['class']
+                final_counts[class_id] = final_counts.get(class_id, 0) + 1
+            print(f"最终检测结果: {final_counts}")
 
             return result
         else:
+            print("未检测到任何高置信度对象")
             return []
 
     except Exception as e:
@@ -207,8 +223,8 @@ def postprocess(outputs, original_size, conf_threshold=0.25):
         return []
 
 
-def non_max_suppression(detections, iou_threshold=0.5):
-    """非极大值抑制"""
+def non_max_suppression(detections, iou_threshold=0.3):  # 更严格的IoU阈值
+    """非极大值抑制 - 更严格版本"""
     if not detections:
         return []
 
@@ -222,7 +238,7 @@ def non_max_suppression(detections, iou_threshold=0.5):
         current = detections.pop(0)
         keep.append(current)
 
-        # 移除重叠的检测
+        # 移除重叠的检测（更严格的重叠判断）
         detections = [
             det for det in detections
             if calculate_iou(current['bbox'], det['bbox']) < iou_threshold
