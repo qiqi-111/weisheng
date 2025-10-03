@@ -17,7 +17,8 @@ CORS(app)
 
 print("正在加载YOLO模型...")
 try:
-    session = ort.InferenceSession("best.onnx")
+    # 修复：添加 providers 参数
+    session = ort.InferenceSession("best.onnx", providers=['CPUExecutionProvider'])
     print("YOLO模型加载成功!")
 except Exception as e:
     print(f"模型加载失败: {e}")
@@ -191,5 +192,5 @@ def calculate_iou(box1, box2):
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)  # debug=False 生产环境
