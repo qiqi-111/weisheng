@@ -88,7 +88,7 @@ def detect():
         return jsonify({
             'success': True,
             'detections': detections,
-            'model_info': 'yolov5_onnx',
+            'model_info': 'yolov8_onnx',
             'detection_count': len(detections)
         })
 
@@ -128,30 +128,30 @@ def preprocess(image):
 
 
 def postprocess(outputs, conf_threshold=0.25):
-    """YOLO后处理 - 简化版本"""
+    """YOLOv8后处理"""
     try:
         print(f"后处理输入形状: {outputs.shape}")
         print(f"后处理输入数据类型: {outputs.dtype}")
 
+        # YOLOv8 输出形状是 [1, 9, 8400]
+        # 9 = [x, y, w, h, conf, class0, class1, class2, class3, class4]
+        # 8400 = 网格点数量
+
+        outputs = outputs[0]  # 去掉batch维度 [9, 8400]
+        print(f"处理后输出形状: {outputs.shape}")
+
+        # 转置为 [8400, 9]
+        outputs = outputs.transpose(1, 0)
+        print(f"转置后形状: {outputs.shape}")
+
         detections = []
 
-        # outputs[0] 形状是 [1, 25200, 85]
-        # 85 = [x, y, w, h, conf, class0, class1, ... class4]
-
-        print(f"输出数据形状: {outputs.shape}")
-        print(f"输出数据类型: {outputs.dtype}")
-
-        # 修复：正确的索引方式
-        for i in range(outputs.shape[1]):
-            if i % 5000 == 0:  # 每5000个检测打印一次
-                print(f"处理第 {i} 个检测...")
-
-            # 修复：正确的索引 - outputs[0, i, :] 而不是 outputs[0][0][i]
-            detection = outputs[0, i, :]
+        for i in range(outputs.shape[0]):
+            detection = outputs[i]
             confidence = detection[4]  # 物体置信度
 
             if confidence > conf_threshold:
-                # 找到类别
+                # 获取类别分数（从第5个元素开始）
                 class_scores = detection[5:]
                 class_id = np.argmax(class_scores)
                 class_confidence = class_scores[class_id]
@@ -160,29 +160,35 @@ def postprocess(outputs, conf_threshold=0.25):
                 final_confidence = confidence * class_confidence
 
                 if final_confidence > conf_threshold:
-                    # 提取边界框 [x, y, w, h] - 已经是中心坐标和宽高
+                    # 提取边界框 [x, y, w, h] - 中心坐标格式
                     x, y, w, h = detection[0], detection[1], detection[2], detection[3]
 
-                    detections.append({
-                        'class': int(class_id),
-                        'name': class_names[class_id],
-                        'chineseName': class_names_chinese[class_id],
-                        'confidence': float(final_confidence),
-                        'bbox': {
-                            'x': float(x),
-                            'y': float(y),
-                            'width': float(w),
-                            'height': float(h)
-                        }
-                    })
+                    # 安全检查：确保 class_id 在有效范围内
+                    if class_id < len(class_names):
+                        detections.append({
+                            'class': int(class_id),
+                            'name': class_names[class_id],
+                            'chineseName': class_names_chinese[class_id],
+                            'confidence': float(final_confidence),
+                            'bbox': {
+                                'x': float(x),
+                                'y': float(y),
+                                'width': float(w),
+                                'height': float(h)
+                            }
+                        })
+                    else:
+                        print(f"警告：class_id {class_id} 超出范围，最大允许: {len(class_names) - 1}")
 
         print(f"初步检测到 {len(detections)} 个对象")
 
-        # 简单的NMS
-        result = simple_nms(detections)
-        print(f"NMS后剩余 {len(result)} 个对象")
-
-        return result
+        # 应用NMS
+        if detections:
+            result = non_max_suppression(detections)
+            print(f"NMS后剩余 {len(result)} 个对象")
+            return result
+        else:
+            return []
 
     except Exception as e:
         print(f"后处理错误: {str(e)}")
@@ -190,56 +196,65 @@ def postprocess(outputs, conf_threshold=0.25):
         raise e
 
 
-def simple_nms(detections, iou_threshold=0.5):
-    """简化的非极大值抑制"""
-    if len(detections) == 0:
+def non_max_suppression(detections, iou_threshold=0.45):
+    """非极大值抑制"""
+    if not detections:
         return []
 
     # 按置信度排序
-    detections.sort(key=lambda x: x['confidence'], reverse=True)
+    detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
 
     keep = []
-    while detections:
-        current = detections.pop(0)
-        keep.append(current)
 
-        # 移除重叠的检测
-        detections = [
-            det for det in detections
-            if calculate_iou(current['bbox'], det['bbox']) < iou_threshold
-        ]
+    while detections:
+        # 取置信度最高的检测
+        best = detections.pop(0)
+        keep.append(best)
+
+        # 计算与剩余检测的IoU
+        remaining = []
+        for detection in detections:
+            iou = calculate_iou(best['bbox'], detection['bbox'])
+            if iou < iou_threshold:
+                remaining.append(detection)
+
+        detections = remaining
 
     return keep
 
 
 def calculate_iou(box1, box2):
-    """计算IoU"""
-    # 转换为 [x1, y1, x2, y2] 格式
-    box1_x1 = box1['x'] - box1['width'] / 2
-    box1_y1 = box1['y'] - box1['height'] / 2
-    box1_x2 = box1['x'] + box1['width'] / 2
-    box1_y2 = box1['y'] + box1['height'] / 2
+    """计算两个边界框的IoU"""
+    # 将中心坐标转换为角坐标
+    x1 = box1['x'] - box1['width'] / 2
+    y1 = box1['y'] - box1['height'] / 2
+    x2 = box1['x'] + box1['width'] / 2
+    y2 = box1['y'] + box1['height'] / 2
 
-    box2_x1 = box2['x'] - box2['width'] / 2
-    box2_y1 = box2['y'] - box2['height'] / 2
-    box2_x2 = box2['x'] + box2['width'] / 2
-    box2_y2 = box2['y'] + box2['height'] / 2
+    x3 = box2['x'] - box2['width'] / 2
+    y3 = box2['y'] - box2['height'] / 2
+    x4 = box2['x'] + box2['width'] / 2
+    y4 = box2['y'] + box2['height'] / 2
 
-    # 计算交集
-    inter_x1 = max(box1_x1, box2_x1)
-    inter_y1 = max(box1_y1, box2_y1)
-    inter_x2 = min(box1_x2, box2_x2)
-    inter_y2 = min(box1_y2, box2_y2)
+    # 计算交集区域
+    x_left = max(x1, x3)
+    y_top = max(y1, y3)
+    x_right = min(x2, x4)
+    y_bottom = min(y2, y4)
 
-    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
-    box1_area = box1['width'] * box1['height']
-    box2_area = box2['width'] * box2['height']
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
 
-    union_area = box1_area + box2_area - inter_area
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
 
-    return inter_area / union_area if union_area > 0 else 0
+    # 计算并集区域
+    box1_area = (x2 - x1) * (y2 - y1)
+    box2_area = (x4 - x3) * (y4 - y3)
+    union_area = box1_area + box2_area - intersection_area
+
+    return intersection_area / union_area if union_area > 0 else 0
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)  # debug=False 生产环境
+    app.run(host='0.0.0.0', port=port, debug=False)
