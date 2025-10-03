@@ -127,7 +127,7 @@ def preprocess(image):
         raise e
 
 
-def postprocess(outputs, conf_threshold=0.25):
+def postprocess(outputs, conf_threshold=0.1):  # 降低置信度阈值
     """YOLOv8后处理"""
     try:
         print(f"后处理输入形状: {outputs.shape}")
@@ -142,15 +142,29 @@ def postprocess(outputs, conf_threshold=0.25):
 
         # 转置为 [8400, 9]
         outputs = outputs.transpose(1, 0)
-        print(f"转置后形状: {outputs.shape}")
+        print(f"转置后形状: {8400, 9}")
 
         detections = []
+        high_conf_count = 0
+        total_checked = 0
+
+        # 检查前100个检测点的置信度分布
+        sample_confidences = []
+        for i in range(min(100, outputs.shape[0])):
+            confidence = outputs[i, 4]
+            sample_confidences.append(confidence)
+
+        print(f"前100个检测点的置信度范围: {min(sample_confidences):.4f} - {max(sample_confidences):.4f}")
+        print(f"置信度大于0.1的数量: {sum(1 for c in sample_confidences if c > 0.1)}")
+        print(f"置信度大于0.05的数量: {sum(1 for c in sample_confidences if c > 0.05)}")
+        print(f"置信度大于0.01的数量: {sum(1 for c in sample_confidences if c > 0.01)}")
 
         for i in range(outputs.shape[0]):
             detection = outputs[i]
             confidence = detection[4]  # 物体置信度
 
             if confidence > conf_threshold:
+                high_conf_count += 1
                 # 获取类别分数（从第5个元素开始）
                 class_scores = detection[5:]
                 class_id = np.argmax(class_scores)
@@ -180,6 +194,11 @@ def postprocess(outputs, conf_threshold=0.25):
                     else:
                         print(f"警告：class_id {class_id} 超出范围，最大允许: {len(class_names) - 1}")
 
+            total_checked += 1
+            if total_checked % 2000 == 0:
+                print(f"已检查 {total_checked} 个检测点，高置信度({conf_threshold})数量: {high_conf_count}")
+
+        print(f"置信度>{conf_threshold}的检测点数量: {high_conf_count}")
         print(f"初步检测到 {len(detections)} 个对象")
 
         # 应用NMS
@@ -188,12 +207,62 @@ def postprocess(outputs, conf_threshold=0.25):
             print(f"NMS后剩余 {len(result)} 个对象")
             return result
         else:
+            print("未检测到任何对象，尝试降低置信度阈值...")
+            # 如果没检测到，尝试使用更低的阈值重新处理
+            if conf_threshold > 0.05:
+                return postprocess_with_lower_threshold(outputs)
             return []
 
     except Exception as e:
         print(f"后处理错误: {str(e)}")
         print(f"错误堆栈: {traceback.format_exc()}")
         raise e
+
+
+def postprocess_with_lower_threshold(outputs):
+    """使用更低置信度阈值的后处理"""
+    print("尝试使用更低置信度阈值(0.05)进行检测...")
+    try:
+        outputs = outputs[0].transpose(1, 0)
+        detections = []
+
+        for i in range(outputs.shape[0]):
+            detection = outputs[i]
+            confidence = detection[4]
+
+            if confidence > 0.05:  # 更低的阈值
+                class_scores = detection[5:]
+                class_id = np.argmax(class_scores)
+                class_confidence = class_scores[class_id]
+                final_confidence = confidence * class_confidence
+
+                if final_confidence > 0.05:
+                    x, y, w, h = detection[0], detection[1], detection[2], detection[3]
+
+                    if class_id < len(class_names):
+                        detections.append({
+                            'class': int(class_id),
+                            'name': class_names[class_id],
+                            'chineseName': class_names_chinese[class_id],
+                            'confidence': float(final_confidence),
+                            'bbox': {
+                                'x': float(x),
+                                'y': float(y),
+                                'width': float(w),
+                                'height': float(h)
+                            }
+                        })
+
+        print(f"使用低阈值检测到 {len(detections)} 个对象")
+        if detections:
+            result = non_max_suppression(detections, iou_threshold=0.3)
+            print(f"低阈值NMS后剩余 {len(result)} 个对象")
+            return result
+        return []
+
+    except Exception as e:
+        print(f"低阈值后处理错误: {str(e)}")
+        return []
 
 
 def non_max_suppression(detections, iou_threshold=0.45):
