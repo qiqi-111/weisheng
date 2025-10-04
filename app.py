@@ -4,6 +4,8 @@ import onnxruntime as ort
 import numpy as np
 from PIL import Image
 import os
+import base64
+import io
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -29,8 +31,20 @@ except Exception as e:
     model = None
 
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+def base64_to_image(base64_string):
+    """将Base64字符串转换为PIL图像"""
+    try:
+        # 移除可能的数据URL前缀
+        if ',' in base64_string:
+            base64_string = base64_string.split(',')[1]
+
+        # 解码Base64
+        image_data = base64.b64decode(base64_string)
+        image = Image.open(io.BytesIO(image_data)).convert('RGB')
+        return image
+    except Exception as e:
+        print(f"Base64转换错误: {e}")
+        return None
 
 
 def preprocess(image):
@@ -159,34 +173,61 @@ def scale_boxes(boxes, original_shape):
 
 @app.route('/detect', methods=['POST'])
 def detect_objects():
-    """检测接口 - 纯ONNX Runtime"""
+    """检测接口 - 支持Base64和文件上传"""
     if model is None:
         return jsonify({'error': 'Model not loaded'}), 500
 
     try:
-        # 检查文件
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file uploaded'}), 400
+        image = None
+        original_size = None
 
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
+        # 检查是否是Base64格式
+        if request.content_type == 'application/json':
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'No JSON data provided'}), 400
 
-        if not allowed_file(file.filename):
-            return jsonify({'error': 'Invalid file type'}), 400
+            # 从JSON中获取Base64图片
+            base64_image = data.get('image') or data.get('base64') or data.get('file')
+            if not base64_image:
+                return jsonify({'error': 'No image data in JSON'}), 400
 
-        # 保存文件
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+            print(f"收到Base64图片，长度: {len(base64_image)}")
+            image = base64_to_image(base64_image)
+            if image is None:
+                return jsonify({'error': 'Invalid base64 image'}), 400
 
-        # 使用PIL读取图片
-        try:
-            image = Image.open(filepath).convert('RGB')
             original_size = image.size  # (width, height)
-        except Exception as e:
+
+        # 检查是否是文件上传
+        elif 'file' in request.files:
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({'error': 'No file selected'}), 400
+
+            # 保存临时文件
+            filename = secure_filename(file.filename)
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(filepath)
+
+            # 读取图片
+            try:
+                image = Image.open(filepath).convert('RGB')
+                original_size = image.size
+            except Exception as e:
+                os.remove(filepath)
+                return jsonify({'error': f'Invalid image: {str(e)}'}), 400
+
+            # 清理临时文件
             os.remove(filepath)
-            return jsonify({'error': f'Invalid image: {str(e)}'}), 400
+
+        else:
+            return jsonify({'error': 'No image data provided. Send JSON with base64 image or multipart file'}), 400
+
+        if image is None:
+            return jsonify({'error': 'Failed to process image'}), 400
+
+        print(f"图片处理成功，尺寸: {original_size}")
 
         # 预处理
         input_blob = preprocess(image)
@@ -194,43 +235,52 @@ def detect_objects():
         # 推理
         input_name = model.get_inputs()[0].name
         outputs = model.run(None, {input_name: input_blob})
+        print("推理完成")
 
         # 后处理
         boxes, scores, class_ids = postprocess(outputs)
+        print(f"检测到 {len(boxes)} 个目标")
 
         # 缩放回原始尺寸
         boxes = scale_boxes(boxes, original_size)
 
-        # 构建响应
-        results = []
+        # 构建响应 - 适配你的小程序格式
+        garbage_details = []
         for i, box in enumerate(boxes):
             class_id = int(class_ids[i])
             class_name = CLASS_NAMES[class_id] if class_id < len(CLASS_NAMES) else f"unknown_{class_id}"
 
-            results.append({
-                'class_id': class_id,
-                'class_name': class_name,
+            # 转换为相对坐标 (0-1范围)
+            width = original_size[0]
+            height = original_size[1]
+
+            garbage_details.append({
+                'class': class_id,
+                'name': class_name,
+                'chineseName': class_name,  # 你可以在这里添加中文名称映射
                 'confidence': float(scores[i]),
                 'bbox': {
-                    'x1': float(box[0]),
-                    'y1': float(box[1]),
-                    'x2': float(box[2]),
-                    'y2': float(box[3])
+                    'x': float(box[0]) / width,
+                    'y': float(box[1]) / height,
+                    'width': float(box[2] - box[0]) / width,
+                    'height': float(box[3] - box[1]) / height
                 }
             })
 
-        # 清理文件
-        os.remove(filepath)
+        # 计算分数 (根据检测数量)
+        garbage_count = len(garbage_details)
+        score = max(0, 100 - garbage_count * 10)  # 每个垃圾扣10分
 
         return jsonify({
             'success': True,
-            'detections': results,
-            'detection_count': len(results)
+            'score': score,
+            'garbageCount': garbage_count,
+            'garbageDetails': garbage_details,
+            'modelUsed': 'onnx_model'
         })
 
     except Exception as e:
-        if 'filepath' in locals() and os.path.exists(filepath):
-            os.remove(filepath)
+        print(f"服务器错误: {e}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 
@@ -245,7 +295,8 @@ def index():
     return jsonify({
         'service': 'Garbage Detection API',
         'status': 'running' if model is not None else 'model_not_loaded',
-        'endpoint': '/detect (POST)'
+        'endpoint': '/detect (POST)',
+        'supported_formats': ['multipart/form-data', 'application/json (base64)']
     })
 
 
