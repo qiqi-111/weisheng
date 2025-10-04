@@ -1,146 +1,130 @@
-# app.py - 最终生产版本
-import onnxruntime as ort
+# app.py
 from flask import Flask, request, jsonify
-import cv2
-import numpy as np
-from werkzeug.utils import secure_filename
+import subprocess
 import os
-import logging
-
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import json
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
-# 配置
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
-app.config['UPLOAD_FOLDER'] = 'uploads/'
-app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'webp'}
+# 基础配置
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg'}
 
-# 创建上传文件夹
+# 创建目录
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# 模型配置
+# 模型路径
 MODEL_PATH = 'best_compressed.onnx'
 CLASS_NAMES = ['paper', 'cup', 'citrus', 'bottle', 'battery']
-
-# NMS参数 - 使用经过验证的通用值
-CONF_THRESHOLD = 0.25
-IOU_THRESHOLD = 0.45
-
-
-# 加载模型
-def load_model():
-    try:
-        logger.info("正在加载模型...")
-        session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
-        logger.info("✅ 模型加载成功")
-        return session
-    except Exception as e:
-        logger.error(f"❌ 模型加载失败: {e}")
-        raise
-
-
-model = load_model()
 
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
 
-def preprocess(image, input_size=(640, 640)):
-    """图像预处理"""
-    resized = cv2.resize(image, input_size).astype(np.float32) / 255.0
-    blob = resized.transpose(2, 0, 1)
-    blob = np.expand_dims(blob, axis=0)
-    return blob
-
-
-def postprocess(outputs, conf_threshold=CONF_THRESHOLD, iou_threshold=IOU_THRESHOLD):
-    """后处理函数"""
+def parse_yolo_output(image_path):
+    """解析YOLO命令的输出"""
     try:
-        output = outputs[0]  # [1, 9, 8400]
-        predictions = np.squeeze(output, 0).T  # [8400, 9]
+        # 运行YOLO检测命令
+        cmd = f"yolo predict model={MODEL_PATH} source='{image_path}' save=False"
+        print(f"执行命令: {cmd}")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
 
-        # 提取预测结果
-        boxes = predictions[:, 0:4]
-        scores = predictions[:, 4:]
+        print(f"返回码: {result.returncode}")
+        print(f"标准输出: {result.stdout}")
+        if result.stderr:
+            print(f"错误输出: {result.stderr}")
 
-        # 找到最佳类别和置信度
-        class_ids = np.argmax(scores, axis=1)
-        confidences = np.max(scores, axis=1)
+        if result.returncode != 0:
+            return []
 
-        # 过滤低置信度检测
-        valid_mask = confidences > conf_threshold
-        boxes = boxes[valid_mask]
-        confidences = confidences[valid_mask]
-        class_ids = class_ids[valid_mask]
+        # 解析YOLO输出 - 根据实际输出格式调整
+        output = result.stdout
+        detections = []
 
-        if len(boxes) == 0:
-            return [], [], []
+        # 方法1: 查找包含类别名的行
+        lines = output.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            # 查找包含类别名称的行
+            for class_name in CLASS_NAMES:
+                if class_name in line.lower():
+                    # 尝试解析置信度和坐标
+                    parts = line.split()
+                    confidence = None
+                    bbox = []
 
-        # 坐标转换
-        x_center, y_center, width, height = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-        x1 = x_center - width / 2
-        y1 = y_center - height / 2
-        x2 = x_center + width / 2
-        y2 = y_center + height / 2
-        boxes_corner = np.column_stack([x1, y1, x2, y2])
+                    # 查找置信度 (通常以%或小数形式)
+                    for part in parts:
+                        if '%' in part:
+                            confidence = float(part.replace('%', '')) / 100.0
+                            break
+                        elif part.replace('.', '').isdigit() and 0 <= float(part) <= 1:
+                            confidence = float(part)
 
-        # 应用NMS
-        indices = cv2.dnn.NMSBoxes(
-            boxes_corner.tolist(),
-            confidences.tolist(),
-            conf_threshold,
-            iou_threshold
-        )
+                    # 查找坐标数字
+                    for part in parts:
+                        if part.replace('.', '').replace('-', '').isdigit():
+                            bbox.append(float(part))
+                            if len(bbox) >= 4:
+                                break
 
-        if len(indices) > 0:
-            indices = indices.flatten()
-            return boxes_corner[indices], confidences[indices], class_ids[indices]
-        else:
-            return [], [], []
+                    if confidence is not None and len(bbox) >= 4:
+                        class_id = CLASS_NAMES.index(class_name)
+                        detections.append({
+                            'class_id': class_id,
+                            'class_name': class_name,
+                            'confidence': confidence,
+                            'bbox': {
+                                'x1': bbox[0],
+                                'y1': bbox[1],
+                                'x2': bbox[2],
+                                'y2': bbox[3]
+                            }
+                        })
+                    break
 
+        # 方法2: 如果方法1没找到，尝试JSON格式解析
+        if not detections and '[' in output and ']' in output:
+            try:
+                # 尝试从输出中提取JSON数据
+                start = output.find('[')
+                end = output.find(']') + 1
+                json_str = output[start:end]
+                json_data = json.loads(json_str)
+
+                for item in json_data:
+                    if isinstance(item, dict) and 'class' in item:
+                        class_name = item.get('class', '')
+                        if class_name in CLASS_NAMES:
+                            class_id = CLASS_NAMES.index(class_name)
+                            detections.append({
+                                'class_id': class_id,
+                                'class_name': class_name,
+                                'confidence': item.get('confidence', 0.5),
+                                'bbox': item.get('bbox', {'x1': 0, 'y1': 0, 'x2': 0, 'y2': 0})
+                            })
+            except:
+                pass
+
+        print(f"解析到 {len(detections)} 个检测结果")
+        return detections
+
+    except subprocess.TimeoutExpired:
+        print("YOLO命令执行超时")
+        return []
     except Exception as e:
-        logger.error(f"后处理错误: {e}")
-        return [], [], []
-
-
-def scale_boxes(boxes, original_shape, input_size=640):
-    """缩放检测框"""
-    if len(boxes) == 0:
-        return boxes
-
-    orig_height, orig_width = original_shape[:2]
-    scale = min(input_size / orig_width, input_size / orig_height)
-    new_width = int(orig_width * scale)
-    new_height = int(orig_height * scale)
-
-    dx = (input_size - new_width) / 2
-    dy = (input_size - new_height) / 2
-
-    scaled_boxes = boxes.copy()
-    scaled_boxes[:, [0, 2]] = (scaled_boxes[:, [0, 2]] - dx) / scale
-    scaled_boxes[:, [1, 3]] = (scaled_boxes[:, [1, 3]] - dy) / scale
-
-    scaled_boxes[:, [0, 2]] = np.clip(scaled_boxes[:, [0, 2]], 0, orig_width)
-    scaled_boxes[:, [1, 3]] = np.clip(scaled_boxes[:, [1, 3]], 0, orig_height)
-
-    return scaled_boxes
-
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'healthy', 'model_loaded': True})
+        print(f"解析YOLO输出错误: {e}")
+        return []
 
 
 @app.route('/detect', methods=['POST'])
 def detect_objects():
-    """垃圾检测API - 完全适配小程序"""
+    """检测接口 - 使用YOLO命令"""
     try:
-        logger.info("收到检测请求")
-
+        # 检查文件
         if 'file' not in request.files:
             return jsonify({'error': 'No file uploaded'}), 400
 
@@ -148,62 +132,37 @@ def detect_objects():
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
 
-        if not file or not allowed_file(file.filename):
+        if not allowed_file(file.filename):
             return jsonify({'error': 'Invalid file type'}), 400
 
         # 保存文件
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
+        print(f"文件保存到: {filepath}")
 
-        # 读取图片
-        original_image = cv2.imread(filepath)
-        if original_image is None:
-            os.remove(filepath)
-            return jsonify({'error': 'Invalid image file'}), 400
-
-        original_shape = original_image.shape
-
-        # 预处理和推理
-        input_blob = preprocess(original_image)
-        input_name = model.get_inputs()[0].name
-        outputs = model.run(None, {input_name: input_blob})
-
-        # 后处理
-        boxes, scores, class_ids = postprocess(outputs)
-        boxes = scale_boxes(boxes, original_shape)
-
-        # 构建响应
-        results = []
-        for i, box in enumerate(boxes):
-            class_id = int(class_ids[i])
-            class_name = CLASS_NAMES[class_id] if class_id < len(CLASS_NAMES) else f"unknown_{class_id}"
-
-            results.append({
-                'class_id': class_id,
-                'class_name': class_name,
-                'confidence': float(scores[i]),
-                'bbox': {
-                    'x1': float(box[0]),
-                    'y1': float(box[1]),
-                    'x2': float(box[2]),
-                    'y2': float(box[3])
-                }
-            })
+        # 使用YOLO命令进行检测
+        detections = parse_yolo_output(filepath)
 
         # 清理文件
         os.remove(filepath)
 
         return jsonify({
             'success': True,
-            'detections': results,
-            'detection_count': len(results)
+            'detections': detections,
+            'detection_count': len(detections)
         })
 
     except Exception as e:
+        print(f"服务器错误: {e}")
         if 'filepath' in locals() and os.path.exists(filepath):
             os.remove(filepath)
-        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy', 'message': 'Service is running'})
 
 
 @app.route('/', methods=['GET'])
@@ -211,10 +170,9 @@ def index():
     return jsonify({
         'service': 'Garbage Detection API',
         'status': 'running',
-        'endpoint': '/detect'
+        'endpoint': '/detect (POST)'
     })
 
 
 if __name__ == '__main__':
-    logger.info("启动服务...")
-    app.run(host='0.0.0.0', port=8000, debug=False)
+    app.run(host='0.0.0.0', port=8080)  # 修正为8080端口
