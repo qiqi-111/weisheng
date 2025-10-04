@@ -7,11 +7,8 @@ import base64
 from PIL import Image
 import io
 import os
-import traceback
 
 app = Flask(__name__)
-
-# 允许跨域请求
 CORS(app)
 
 print("正在加载YOLO模型...")
@@ -62,7 +59,11 @@ def detect():
 
         # 解码base64图片
         print("🖼️ 开始解码图片...")
-        image_data = base64.b64decode(data['image'])
+        image_data = data['image']
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
+        image_data = base64.b64decode(image_data)
+
         image = Image.open(io.BytesIO(image_data))
         original_size = image.size
         print(f"图片尺寸: {original_size}")
@@ -81,7 +82,7 @@ def detect():
         print("🔮 开始模型推理...")
         outputs = session.run(None, {session.get_inputs()[0].name: input_tensor})
 
-        # 后处理
+        # 后处理 - 关键修复！
         print("📊 开始后处理...")
         detections = postprocess_yolov8(outputs[0], original_size)
         print(f"✅ 检测完成: {len(detections)} 个对象")
@@ -96,6 +97,8 @@ def detect():
 
     except Exception as e:
         print(f"❌ 检测错误: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             'success': False,
             'error': str(e)
@@ -115,12 +118,16 @@ def preprocess(image):
     return image
 
 
-def postprocess_yolov8(outputs, original_size, conf_threshold=0.5, iou_threshold=0.5):
-    """YOLOv8专用后处理"""
+def postprocess_yolov8(outputs, original_size, conf_threshold=0.25, iou_threshold=0.45):
+    """YOLOv8专用后处理 - 修复版本"""
     try:
-        # YOLOv8输出格式: [1, 9, 8400]
-        outputs = outputs[0]  # [9, 8400]
-        outputs = outputs.transpose(1, 0)  # [8400, 9]
+        # YOLOv8输出格式: [1, 84, 8400]
+        # 84 = 4(bbox) + 80(classes)，但你只有5个类别，所以是9
+        print(f"🔍 模型输出形状: {outputs.shape}")
+
+        # 输出是 [1, 9, 8400]，我们需要转置为 [8400, 9]
+        outputs = outputs[0].transpose(1, 0)  # [8400, 9]
+        print(f"🔍 转置后形状: {outputs.shape}")
 
         detections = []
         original_width, original_height = original_size
@@ -128,6 +135,17 @@ def postprocess_yolov8(outputs, original_size, conf_threshold=0.5, iou_threshold
         # 计算尺度因子
         scale_x = original_width / 640
         scale_y = original_height / 640
+
+        # 调试：打印前几个检测的置信度
+        print("🔍 前5个检测的置信度:")
+        for i in range(min(5, outputs.shape[0])):
+            detection = outputs[i]
+            obj_conf = detection[4]
+            class_probs = detection[5:]
+            class_id = np.argmax(class_probs)
+            class_conf = class_probs[class_id]
+            total_confidence = obj_conf * class_conf
+            print(f"  检测{i}: 总置信度={total_confidence:.3f}, 类别={class_id}({class_names[class_id]})")
 
         for i in range(outputs.shape[0]):
             detection = outputs[i]
@@ -148,7 +166,7 @@ def postprocess_yolov8(outputs, original_size, conf_threshold=0.5, iou_threshold
             # 计算总置信度
             total_confidence = obj_conf * class_conf
 
-            # 应用置信度阈值
+            # 应用置信度阈值 - 降低到0.25提高灵敏度
             if total_confidence > conf_threshold:
                 cx, cy, w, h = bbox
 
@@ -169,7 +187,7 @@ def postprocess_yolov8(outputs, original_size, conf_threshold=0.5, iou_threshold
                 bbox_height = min(bbox_height, original_height - y1)
 
                 # 检查边界框是否合理
-                if bbox_width >= 10 and bbox_height >= 10 and class_id < len(class_names):
+                if bbox_width >= 5 and bbox_height >= 5 and class_id < len(class_names):
                     detections.append({
                         'class': int(class_id),
                         'name': class_names[class_id],
@@ -183,21 +201,26 @@ def postprocess_yolov8(outputs, original_size, conf_threshold=0.5, iou_threshold
                         }
                     })
 
+        print(f"🔍 应用阈值前检测数: {len(detections)}")
+
         # 应用NMS
         if detections:
             detections = non_max_suppression_fast(detections, iou_threshold)
+            print(f"🔍 应用NMS后检测数: {len(detections)}")
 
             # 按置信度排序
             detections.sort(key=lambda x: x['confidence'], reverse=True)
 
             # 限制返回数量
-            if len(detections) > 10:
-                detections = detections[:10]
+            if len(detections) > 20:
+                detections = detections[:20]
 
         return detections
 
     except Exception as e:
         print(f"后处理错误: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return []
 
 
@@ -237,7 +260,7 @@ def non_max_suppression_fast(detections, iou_threshold):
         other_areas = (other_boxes[:, 2] - other_boxes[:, 0]) * (other_boxes[:, 3] - other_boxes[:, 1])
         union = current_area + other_areas - intersection
 
-        iou = intersection / union
+        iou = intersection / (union + 1e-6)  # 避免除零
 
         remaining_indices = np.where(iou <= iou_threshold)[0]
         indices = indices[remaining_indices + 1]
@@ -256,30 +279,58 @@ def health_check():
     })
 
 
-@app.route('/test', methods=['GET'])
-def test_detection():
-    """测试接口"""
+@app.route('/debug_detect', methods=['POST'])
+def debug_detect():
+    """调试接口，返回更详细的信息"""
     try:
+        data = request.get_json()
+        if not data or 'image' not in data:
+            return jsonify({'success': False, 'error': '没有收到图片数据'})
+
         if session is None:
             return jsonify({'success': False, 'error': '模型未加载'})
 
-        # 创建测试图片
-        test_image = np.ones((480, 640, 3), dtype=np.uint8) * 255
-        cv2.rectangle(test_image, (100, 100), (300, 300), (0, 0, 255), -1)
+        # 解码图片
+        image_data = data['image']
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
+        image_data = base64.b64decode(image_data)
 
-        # 转换为base64
-        _, buffer = cv2.imencode('.jpg', test_image)
-        test_image_b64 = base64.b64encode(buffer).decode('utf-8')
+        image = Image.open(io.BytesIO(image_data))
+        original_size = image.size
 
-        test_data = {'image': test_image_b64}
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
 
-        # 模拟检测请求
-        with app.test_client() as client:
-            response = client.post('/detect', json=test_data)
+        image_np = np.array(image)
+        input_tensor = preprocess(image_np)
 
-        return response.get_json()
+        # 模型推理
+        outputs = session.run(None, {session.get_inputs()[0].name: input_tensor})
+
+        # 原始输出信息
+        raw_output = outputs[0]
+        print(f"🔧 调试信息 - 原始输出形状: {raw_output.shape}")
+        print(f"🔧 调试信息 - 原始输出范围: [{raw_output.min():.3f}, {raw_output.max():.3f}]")
+
+        # 测试不同阈值
+        results = {}
+        for conf_thresh in [0.1, 0.2, 0.25, 0.3, 0.4, 0.5]:
+            detections = postprocess_yolov8(outputs[0], original_size, conf_thresh, 0.45)
+            results[f'conf_{conf_thresh}'] = len(detections)
+
+        return jsonify({
+            'success': True,
+            'original_size': original_size,
+            'output_shape': str(raw_output.shape),
+            'output_range': [float(raw_output.min()), float(raw_output.max())],
+            'detections_at_different_thresholds': results,
+            'message': '调试信息已输出到控制台'
+        })
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
 
 
