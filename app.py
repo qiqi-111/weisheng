@@ -119,13 +119,16 @@ def preprocess(image):
 
 
 def postprocess_yolov8(outputs, original_size, conf_threshold=0.25, iou_threshold=0.45):
-    """YOLOv8专用后处理 - 修复版本"""
+    """YOLOv8专用后处理 - 根据原始模型输出格式修复"""
     try:
-        # YOLOv8输出格式: [1, 84, 8400]
-        # 84 = 4(bbox) + 80(classes)，但你只有5个类别，所以是9
+        # 🔧 关键修复：根据原始模型输出格式 [1, 9, 8400]
         print(f"🔍 模型输出形状: {outputs.shape}")
 
-        # 输出是 [1, 9, 8400]，我们需要转置为 [8400, 9]
+        # 验证输出形状
+        if outputs.shape != (1, 9, 8400):
+            print(f"⚠️ 警告: 输出形状 {outputs.shape} 与预期 (1, 9, 8400) 不符")
+
+        # 输出是 [1, 9, 8400]，转置为 [8400, 9]
         outputs = outputs[0].transpose(1, 0)  # [8400, 9]
         print(f"🔍 转置后形状: {outputs.shape}")
 
@@ -136,39 +139,46 @@ def postprocess_yolov8(outputs, original_size, conf_threshold=0.25, iou_threshol
         scale_x = original_width / 640
         scale_y = original_height / 640
 
-        # 调试：打印前几个检测的置信度
-        print("🔍 前5个检测的置信度:")
-        for i in range(min(5, outputs.shape[0])):
+        # 🔧 关键修复：添加详细的调试信息
+        print("🔍 前10个检测的详细信息:")
+        valid_candidates = 0
+        for i in range(min(10, outputs.shape[0])):
             detection = outputs[i]
+            bbox = detection[:4]
             obj_conf = detection[4]
             class_probs = detection[5:]
+
             class_id = np.argmax(class_probs)
             class_conf = class_probs[class_id]
             total_confidence = obj_conf * class_conf
-            print(f"  检测{i}: 总置信度={total_confidence:.3f}, 类别={class_id}({class_names[class_id]})")
 
+            # 显示所有检测，不管阈值
+            if total_confidence > 0.1:  # 低阈值查看所有可能检测
+                valid_candidates += 1
+                cx, cy, w, h = bbox
+                print(
+                    f"  候选{i}: 置信度={total_confidence:.3f}, 类别={class_id}({class_names[class_id]}), bbox=[{cx:.1f},{cy:.1f},{w:.1f},{h:.1f}]")
+
+        print(f"🔍 低阈值(0.1)下候选检测数: {valid_candidates}")
+
+        # 正式处理
         for i in range(outputs.shape[0]):
             detection = outputs[i]
-
-            # 提取边界框坐标 (cx, cy, w, h)
             bbox = detection[:4]
-
-            # 提取对象置信度
             obj_conf = detection[4]
-
-            # 提取类别概率
             class_probs = detection[5:]
 
-            # 找到最可能的类别
             class_id = np.argmax(class_probs)
             class_conf = class_probs[class_id]
-
-            # 计算总置信度
             total_confidence = obj_conf * class_conf
 
-            # 应用置信度阈值 - 降低到0.25提高灵敏度
+            # 应用置信度阈值
             if total_confidence > conf_threshold:
                 cx, cy, w, h = bbox
+
+                # 🔧 关键修复：检查边界框坐标是否合理
+                if cx < 0 or cy < 0 or w <= 0 or h <= 0:
+                    continue
 
                 # 转换为绝对像素坐标
                 x_center = cx * scale_x
@@ -201,7 +211,7 @@ def postprocess_yolov8(outputs, original_size, conf_threshold=0.25, iou_threshol
                         }
                     })
 
-        print(f"🔍 应用阈值前检测数: {len(detections)}")
+        print(f"🔍 应用阈值({conf_threshold})前检测数: {len(detections)}")
 
         # 应用NMS
         if detections:
@@ -315,7 +325,7 @@ def debug_detect():
 
         # 测试不同阈值
         results = {}
-        for conf_thresh in [0.1, 0.2, 0.25, 0.3, 0.4, 0.5]:
+        for conf_thresh in [0.05, 0.1, 0.15, 0.2, 0.25, 0.3]:
             detections = postprocess_yolov8(outputs[0], original_size, conf_thresh, 0.45)
             results[f'conf_{conf_thresh}'] = len(detections)
 
